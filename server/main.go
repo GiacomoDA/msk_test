@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -10,17 +11,19 @@ import (
 )
 
 var (
-	producer    sarama.SyncProducer
-	consumer    sarama.Consumer
-	clientMap   = make(map[string]chan string)
-	clientMapMu sync.Mutex
+	producer      sarama.SyncProducer
+	consumer      sarama.Consumer
+	clientMap     = make(map[string]chan string)
+	requestTimes  = make(map[string]time.Time)
+	clientMapMu   sync.Mutex
+	requestTimesMu sync.Mutex
+	fileMu        sync.Mutex // Mutex for synchronizing file writes
 )
 
 const (
 	// The topic where responses are published
 	replyTopic = "reply_topic"
 )
-
 
 func requestHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract the query parameters
@@ -42,14 +45,16 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 	clientMap[requestID] = responseChan
 	clientMapMu.Unlock()
 
-	fmt.Println("Created channel to receive response")
-	//fmt.Println(clientMap)
+	// Record the time when the request is published
+	requestTimesMu.Lock()
+	requestTimes[requestID] = time.Now()
+	requestTimesMu.Unlock()
 
 	// Publish the value to the given Kafka topic
 	msg := &sarama.ProducerMessage{
 		Topic: topic,
 		Value: sarama.StringEncoder(value),
-		Key: sarama.StringEncoder(requestID),
+		Key:   sarama.StringEncoder(requestID),
 	}
 
 	_, _, err := producer.SendMessage(msg)
@@ -66,53 +71,110 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 	// Wait for the response or timeout
 	select {
 	case response := <-responseChan:
+		// Calculate the time taken for the response to arrive
+		requestTimesMu.Lock()
+		startTime, exists := requestTimes[requestID]
+		if exists {
+			elapsedTime := time.Since(startTime)
+			fmt.Printf("Time taken for request %s: %v\n", requestID, elapsedTime)
+
+			// Save latency to the file
+			saveLatencyToFile(requestID, elapsedTime)
+		}
+		requestTimesMu.Unlock()
+
 		fmt.Fprintf(w, "Response: %s", response)
 	case <-time.After(10 * time.Second):
 		http.Error(w, "Timeout waiting for response", http.StatusGatewayTimeout)
 	}
 
-	// Clean up the client map
+	// Clean up the client map and request times map
 	clientMapMu.Lock()
 	delete(clientMap, requestID)
 	clientMapMu.Unlock()
+
+	requestTimesMu.Lock()
+	delete(requestTimes, requestID)
+	requestTimesMu.Unlock()
 }
 
 func consumeResponses() {
-	// Make the consumer listen on the reply topic
-	partitionConsumer, err := consumer.ConsumePartition(replyTopic, 0, sarama.OffsetNewest)
+	// Get all partitions for the reply_topic
+	partitions, err := consumer.Partitions(replyTopic)
 	if err != nil {
-		fmt.Println("Failed to start Kafka consumer:", err)
+		fmt.Println("Failed to get partitions:", err)
 		return
 	}
-	defer partitionConsumer.Close()
 
-	for message := range partitionConsumer.Messages() {
+	var wg sync.WaitGroup
 
-		// Assuming the message key is the request ID
-		requestID := string(message.Key)
-		response := string(message.Value)
+	// Start a consumer for each partition
+	for _, partition := range partitions {
+		wg.Add(1)
 
-		// use this with lambda function written in python to remove double quotations
-		requestID = requestID[1:len(requestID)-1]
-		response = response[1:len(response)-1]
+		go func(partition int32) {
+			defer wg.Done()
 
-		fmt.Println("Received reply: value=", response, " key=", requestID)
+			// Create a consumer for the partition
+			partitionConsumer, err := consumer.ConsumePartition(replyTopic, partition, sarama.OffsetNewest)
+			if err != nil {
+				fmt.Printf("Failed to start consumer for partition %d: %v\n", partition, err)
+				return
+			}
+			defer partitionConsumer.Close()
 
-		clientMapMu.Lock()
-		if responseChan, ok := clientMap[requestID]; ok {
-			//fmt.Println("channel found")
-			responseChan <- response
-		}
-		clientMapMu.Unlock()
+			// Consume messages from this partition
+			for message := range partitionConsumer.Messages() {
+
+				// Assuming the message key is the request ID
+				requestID := string(message.Key)
+				response := string(message.Value)
+
+				// Use this with lambda function written in python to remove double quotations
+				requestID = requestID[1 : len(requestID)-1]
+				response = response[1 : len(response)-1]
+
+				fmt.Printf("Received reply from partition %d: value=%s, key=%s\n", partition, response, requestID)
+
+				clientMapMu.Lock()
+				if responseChan, ok := clientMap[requestID]; ok {
+					responseChan <- response
+				}
+				clientMapMu.Unlock()
+			}
+		}(partition)
+	}
+
+	// Wait for all partition consumers to finish
+	wg.Wait()
+}
+
+
+func saveLatencyToFile(requestID string, latency time.Duration) {
+	// Open the file in append mode
+	fileMu.Lock()
+	defer fileMu.Unlock()
+
+	file, err := os.OpenFile("latency.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Failed to open latency.txt:", err)
+		return
+	}
+	defer file.Close()
+
+	// Write the latency information to the file
+	_, err = file.WriteString(fmt.Sprintf("%d\n", latency.Milliseconds()))
+	if err != nil {
+		fmt.Println("Failed to write to latency.txt:", err)
 	}
 }
 
 func main() {
 	// Kafka broker addresses
 	brokers := []string{
-	//	"b-1.clustertest.crn5jl.c3.kafka.eu-north-1.amazonaws.com:9092",
-	//	"b-2.clustertest.crn5jl.c3.kafka.eu-north-1.amazonaws.com:9092",
-		"localhost:9092",
+		"b-1.msktest.y9tt7z.c6.kafka.eu-central-1.amazonaws.com:9092",
+		"b-2.msktest.y9tt7z.c6.kafka.eu-central-1.amazonaws.com:9092",
+		//"localhost:9092",
 	}
 
 	// Configure and start the Kafka producer
