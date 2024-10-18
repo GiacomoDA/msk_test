@@ -6,22 +6,23 @@ import (
 	"os"
 	"sync"
 	"time"
+	"log"
 
 	"github.com/IBM/sarama"
 )
 
 var (
-	producer      sarama.SyncProducer
-	consumer      sarama.Consumer
-	clientMap     = make(map[string]chan string)
-	requestTimes  = make(map[string]time.Time)
-	clientMapMu   sync.Mutex
-	requestTimesMu sync.Mutex
-	fileMu        sync.Mutex // Mutex for synchronizing file writes
+	producer     	sarama.SyncProducer
+	consumer     	sarama.Consumer
+	clientMap    	= make(map[string]chan string)
+	requestTimes 	= make(map[string]time.Time)
+	clientMapMu  	sync.Mutex
+	requestTimesMu	sync.Mutex
+	fileMu       	sync.Mutex
+	logger		 	= log.New(os.Stdout, "", log.Ltime)
 )
 
 const (
-	// The topic where responses are published
 	replyTopic = "reply_topic"
 )
 
@@ -31,7 +32,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 	value := r.URL.Query().Get("value")
 	requestID := r.URL.Query().Get("request_id")
 
-	fmt.Println("Received HTTP request with values:", topic, " ", value, " ", requestID)
+	logger.Println("Received HTTP request:", topic, " ", value, " ", requestID)
 
 	// If any parameter is missing, send a bad request status
 	if topic == "" || value == "" || requestID == "" {
@@ -66,7 +67,7 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Kafka event published")
+	//logger.Println("Kafka event published on topic ", topic)
 
 	// Wait for the response or timeout
 	select {
@@ -76,14 +77,14 @@ func requestHandler(w http.ResponseWriter, r *http.Request) {
 		startTime, exists := requestTimes[requestID]
 		if exists {
 			elapsedTime := time.Since(startTime)
-			fmt.Printf("Time taken for request %s: %v\n", requestID, elapsedTime)
+			logger.Printf("Time taken for request %s: %v\n", requestID, elapsedTime)
 
 			// Save latency to the file
 			saveLatencyToFile(requestID, elapsedTime)
 		}
 		requestTimesMu.Unlock()
 
-		fmt.Fprintf(w, "Response: %s", response)
+		fmt.Fprintf(w, "Response: %s\n", response)
 	case <-time.After(10 * time.Second):
 		http.Error(w, "Timeout waiting for response", http.StatusGatewayTimeout)
 	}
@@ -102,7 +103,7 @@ func consumeResponses() {
 	// Get all partitions for the reply_topic
 	partitions, err := consumer.Partitions(replyTopic)
 	if err != nil {
-		fmt.Println("Failed to get partitions:", err)
+		logger.Println("Failed to get partitions:", err)
 		return
 	}
 
@@ -118,7 +119,7 @@ func consumeResponses() {
 			// Create a consumer for the partition
 			partitionConsumer, err := consumer.ConsumePartition(replyTopic, partition, sarama.OffsetNewest)
 			if err != nil {
-				fmt.Printf("Failed to start consumer for partition %d: %v\n", partition, err)
+				logger.Printf("Failed to start consumer for partition %d: %v\n", partition, err)
 				return
 			}
 			defer partitionConsumer.Close()
@@ -130,11 +131,7 @@ func consumeResponses() {
 				requestID := string(message.Key)
 				response := string(message.Value)
 
-				// Use this with lambda function written in python to remove double quotations
-				requestID = requestID[1 : len(requestID)-1]
-				response = response[1 : len(response)-1]
-
-				fmt.Printf("Received reply from partition %d: value=%s, key=%s\n", partition, response, requestID)
+				logger.Printf("Received reply from partition %d: value=%s, key=%s\n", partition, response, requestID)
 
 				clientMapMu.Lock()
 				if responseChan, ok := clientMap[requestID]; ok {
@@ -157,7 +154,7 @@ func saveLatencyToFile(requestID string, latency time.Duration) {
 
 	file, err := os.OpenFile("latency.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Println("Failed to open latency.txt:", err)
+		logger.Println("Failed to open latency.txt:", err)
 		return
 	}
 	defer file.Close()
@@ -165,15 +162,15 @@ func saveLatencyToFile(requestID string, latency time.Duration) {
 	// Write the latency information to the file
 	_, err = file.WriteString(fmt.Sprintf("%d\n", latency.Milliseconds()))
 	if err != nil {
-		fmt.Println("Failed to write to latency.txt:", err)
+		logger.Println("Failed to write to latency.txt:", err)
 	}
 }
 
 func main() {
 	// Kafka broker addresses
 	brokers := []string{
-		"b-1.msktest.y9tt7z.c6.kafka.eu-central-1.amazonaws.com:9092",
-		"b-2.msktest.y9tt7z.c6.kafka.eu-central-1.amazonaws.com:9092",
+		"b-1.msktest.y2ths2.c3.kafka.eu-central-1.amazonaws.com:9092",
+		"b-2.msktest.y2ths2.c3.kafka.eu-central-1.amazonaws.com:9092",
 		//"localhost:9092",
 	}
 
@@ -184,7 +181,7 @@ func main() {
 	var err error
 	producer, err = sarama.NewSyncProducer(brokers, config)
 	if err != nil {
-		fmt.Println("Failed to start Kafka producer:", err)
+		logger.Println("Failed to start Kafka producer:", err)
 		return
 	}
 	defer producer.Close()
@@ -192,7 +189,7 @@ func main() {
 	// Start the Kafka consumer
 	consumer, err = sarama.NewConsumer(brokers, nil)
 	if err != nil {
-		fmt.Println("Failed to start Kafka consumer:", err)
+		logger.Println("Failed to start Kafka consumer:", err)
 		return
 	}
 	defer consumer.Close()
@@ -204,8 +201,8 @@ func main() {
 	http.HandleFunc("/", requestHandler)
 
 	// Start the server on port 8080
-	fmt.Println("Server is listening on port 8080...")
+	logger.Println("Server is listening on port 8080...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Println("Failed to start server:", err)
+		logger.Println("Failed to start server:", err)
 	}
 }
