@@ -5,26 +5,29 @@ local function pad(num)
     return string.format("%03d", num)
 end
 
+init = function(args)
+    counter = counter + math.random(1000000)
+end
+
 -- Initialize the request
 request = function()
     counter = counter + 1
     local value = pad(counter)
     local request_id = pad(counter)
     local path = string.format("/?topic=test_topic1&value=%s&request_id=%s", value, request_id)
-    print(path)
+    -- print(path)
     return wrk.format("GET", path)
 end
 
 -- Optional: You can add response() function to track responses
 response = function(status, headers, body)
-    print(status)
-    print(body)
     -- You can add logic here to track responses if needed
     -- For example:
     if status ~= 200 then
         print(status)
-        print(headers)
-        -- Track successful responses
+        print(body)
+    else
+        -- print(".")
     end
 end
 
